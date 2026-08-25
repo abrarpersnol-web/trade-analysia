@@ -35,14 +35,29 @@ async def analyze_market(symbol: str = "BTC"):
             top_pair = pairs[0]
             price_usd = float(top_pair.get("priceUsd", 0))
             change_24h = float(top_pair.get("priceChange", {}).get("h24", 0))
+            change_5m = float(top_pair.get("priceChange", {}).get("m5", 0))
 
-            # Technical calculations based on momentum
+            # Scalping Signal & 15s Direction Logic
             signal = "BUY" if change_24h > 0 else "SELL"
             trend = "Bullish" if change_24h > 0 else "Bearish"
             confidence = f"{min(85 + abs(change_24h), 98):.1f}%"
             rsi = f"{min(max(50 + (change_24h * 1.5), 15), 85):.1f}"
 
-            # Dynamic price targets
+            # 15-Second High-Frequency Market Direction Prediction
+            if change_5m > 0.05:
+                pred_15s = "STRONG UP ↑"
+                pred_color = "emerald"
+            elif change_5m > 0:
+                pred_15s = "SLIGHT UP ↑"
+                pred_color = "emerald"
+            elif change_5m < -0.05:
+                pred_15s = "STRONG DOWN ↓"
+                pred_color = "rose"
+            else:
+                pred_15s = "SLIGHT DOWN ↓"
+                pred_color = "rose"
+
+            # Targets calculation
             if signal == "BUY":
                 entry = f"${price_usd * 0.998:,.4f} - ${price_usd:,.4f}"
                 sl = f"${price_usd * 0.985:,.4f}"
@@ -62,6 +77,8 @@ async def analyze_market(symbol: str = "BTC"):
                 "signal": signal,
                 "confidence": confidence,
                 "rsi": rsi,
+                "prediction_15s": pred_15s,
+                "prediction_color": pred_color,
                 "entry_zone": entry,
                 "stop_loss": sl,
                 "take_profit": tp,
