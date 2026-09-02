@@ -1,88 +1,109 @@
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 import os
+import hmac
+import hashlib
+import json
+import requests
+from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks, status, Query
+from dotenv import load_dotenv
 
-app = FastAPI(title="Trade Analysia Engine")
+# .env file se variables load karein
+load_dotenv()
 
-if not os.path.exists("static"):
-    os.makedirs("static")
-if not os.path.exists("templates"):
-    os.makedirs("templates")
+app = FastAPI(title="Trade Analysia - Salla Backend Engine")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# Environment Variables
+SALLA_CLIENT_ID = os.getenv("SALLA_CLIENT_ID")
+SALLA_CLIENT_SECRET = os.getenv("SALLA_CLIENT_SECRET")
+SALLA_REDIRECT_URI = os.getenv("SALLA_REDIRECT_URI")
+SALLA_WEBHOOK_SECRET = os.getenv("SALLA_WEBHOOK_SECRET", SALLA_CLIENT_SECRET)
 
+# -------------------------------------------------------------------
+# Helper: Salla Webhook HMAC Signature Verify
+# -------------------------------------------------------------------
+def verify_salla_signature(raw_body: bytes, signature: str) -> bool:
+    if not signature or not SALLA_WEBHOOK_SECRET:
+        return False
+    expected_sig = hmac.new(
+        SALLA_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected_sig, signature)
 
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
+# -------------------------------------------------------------------
+# Background Task: Order Event Worker
+# -------------------------------------------------------------------
+async def process_salla_event(event_name: str, merchant_id: str, data: dict):
+    print(f"⚡ [WORKER] Event: '{event_name}' | Merchant: #{merchant_id}")
 
+    if event_name == "order.created":
+        order_id = data.get("id")
+        total_price = data.get("amount", {}).get("amount", 0)
+        currency = data.get("amount", {}).get("currency", "SAR")
+        customer = data.get("customer", {}).get("first_name", "Valued Customer")
+        
+        print(f"🛒 New Order Received #{order_id} from {customer} | Total: {total_price} {currency}")
+        # Yahan aap apna WhatsApp Alert / Database Save logic add kar sakte hain.
 
-@app.get("/api/analyze")
-async def analyze_market(symbol: str = "BTC"):
-    url = f"https://api.dexscreener.com/latest/dex/search?q={symbol}"
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
+@app.get("/")
+def home():
+    return {"status": "online", "app": "Trade Analysia Salla Engine"}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
+# 1. OAuth Callback Endpoint
+@app.get("/oauth/callback")
+async def salla_oauth_callback(code: str = Query(...)):
+    token_url = "https://accounts.salla.sa/oauth2/token"
+    payload = {
+        "client_id": SALLA_CLIENT_ID,
+        "client_secret": SALLA_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": SALLA_REDIRECT_URI
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    if response.status_code == 200:
-        data = response.json()
-        pairs = data.get("pairs", [])
-        if pairs:
-            top_pair = pairs[0]
-            price_usd = float(top_pair.get("priceUsd", 0))
-            change_24h = float(top_pair.get("priceChange", {}).get("h24", 0))
-            change_5m = float(top_pair.get("priceChange", {}).get("m5", 0))
+    response = requests.post(token_url, data=payload, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"OAuth Failed: {response.text}")
+        
+    token_data = response.json()
+    return {
+        "status": "success",
+        "message": "Merchant Authorized Successfully!",
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token")
+    }
 
-            # Scalping Signal & 15s Direction Logic
-            signal = "BUY" if change_24h > 0 else "SELL"
-            trend = "Bullish" if change_24h > 0 else "Bearish"
-            confidence = f"{min(85 + abs(change_24h), 98):.1f}%"
-            rsi = f"{min(max(50 + (change_24h * 1.5), 15), 85):.1f}"
+# 2. Salla Webhook Endpoint
+@app.post("/webhook/salla", status_code=status.HTTP_200_OK)
+async def handle_salla_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_salla_signature: str = Header(None, alias="X-Salla-Signature")
+):
+    body_bytes = await request.body()
 
-            # 15-Second High-Frequency Market Direction Prediction
-            if change_5m > 0.05:
-                pred_15s = "STRONG UP ↑"
-                pred_color = "emerald"
-            elif change_5m > 0:
-                pred_15s = "SLIGHT UP ↑"
-                pred_color = "emerald"
-            elif change_5m < -0.05:
-                pred_15s = "STRONG DOWN ↓"
-                pred_color = "rose"
-            else:
-                pred_15s = "SLIGHT DOWN ↓"
-                pred_color = "rose"
+    # Signature validation (Production Security)
+    if x_salla_signature and not verify_salla_signature(body_bytes, x_salla_signature):
+        raise HTTPException(status_code=401, detail="Invalid HMAC Signature")
 
-            # Targets calculation
-            if signal == "BUY":
-                entry = f"${price_usd * 0.998:,.4f} - ${price_usd:,.4f}"
-                sl = f"${price_usd * 0.985:,.4f}"
-                tp = f"${price_usd * 1.035:,.4f}"
-            else:
-                entry = f"${price_usd:,.4f} - ${price_usd * 1.002:,.4f}"
-                sl = f"${price_usd * 1.015:,.4f}"
-                tp = f"${price_usd * 0.965:,.4f}"
+    try:
+        payload = json.loads(body_bytes.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON Payload")
 
-            return {
-                "status": "success",
-                "symbol": top_pair.get("baseToken", {}).get("symbol", symbol),
-                "pair_name": f"{top_pair.get('baseToken', {}).get('symbol')}/{top_pair.get('quoteToken', {}).get('symbol')}",
-                "price": f"${price_usd:,.4f}",
-                "change_24h": f"{change_24h}%",
-                "trend": trend,
-                "signal": signal,
-                "confidence": confidence,
-                "rsi": rsi,
-                "prediction_15s": pred_15s,
-                "prediction_color": pred_color,
-                "entry_zone": entry,
-                "stop_loss": sl,
-                "take_profit": tp,
-                "dex": top_pair.get("dexId", "N/A"),
-            }
+    event_type = payload.get("event")
+    merchant = payload.get("merchant")
+    event_data = payload.get("data", {})
 
-    return {"status": "error", "message": "Symbol not found"}
+    background_tasks.add_task(
+        process_salla_event,
+        event_name=event_type,
+        merchant_id=str(merchant),
+        data=event_data
+    )
+
+    return {"status": "success", "message": "Webhook acknowledged"}
